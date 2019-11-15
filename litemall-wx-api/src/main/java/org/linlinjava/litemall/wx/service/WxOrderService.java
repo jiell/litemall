@@ -3,6 +3,7 @@ package org.linlinjava.litemall.wx.service;
 import com.github.binarywang.wxpay.bean.notify.WxPayNotifyResponse;
 import com.github.binarywang.wxpay.bean.notify.WxPayOrderNotifyResult;
 import com.github.binarywang.wxpay.bean.order.WxPayMpOrderResult;
+import com.github.binarywang.wxpay.bean.order.WxPayMwebOrderResult;
 import com.github.binarywang.wxpay.bean.request.WxPayUnifiedOrderRequest;
 import com.github.binarywang.wxpay.bean.result.BaseWxPayResult;
 import com.github.binarywang.wxpay.constant.WxPayConstants;
@@ -17,6 +18,7 @@ import org.linlinjava.litemall.core.notify.NotifyService;
 import org.linlinjava.litemall.core.notify.NotifyType;
 import org.linlinjava.litemall.core.qcode.QCodeService;
 import org.linlinjava.litemall.core.system.SystemConfig;
+import org.linlinjava.litemall.core.task.TaskService;
 import org.linlinjava.litemall.core.util.DateTimeUtil;
 import org.linlinjava.litemall.core.util.JacksonUtil;
 import org.linlinjava.litemall.core.util.ResponseUtil;
@@ -26,6 +28,7 @@ import org.linlinjava.litemall.db.util.CouponUserConstant;
 import org.linlinjava.litemall.db.util.OrderHandleOption;
 import org.linlinjava.litemall.db.util.OrderUtil;
 import org.linlinjava.litemall.core.util.IpUtil;
+import org.linlinjava.litemall.wx.task.OrderUnpaidTask;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -104,6 +107,8 @@ public class WxOrderService {
     private LitemallCouponUserService couponUserService;
     @Autowired
     private CouponVerifyService couponVerifyService;
+    @Autowired
+    private TaskService taskService;
 
     /**
      * 订单列表
@@ -186,6 +191,7 @@ public class WxOrderService {
         Map<String, Object> orderVo = new HashMap<String, Object>();
         orderVo.put("id", order.getId());
         orderVo.put("orderSn", order.getOrderSn());
+        orderVo.put("message", order.getMessage());
         orderVo.put("addTime", order.getAddTime());
         orderVo.put("consignee", order.getConsignee());
         orderVo.put("mobile", order.getMobile());
@@ -421,6 +427,9 @@ public class WxOrderService {
             grouponService.createGroupon(groupon);
         }
 
+        // 订单支付超期任务
+        taskService.addTask(new OrderUnpaidTask(orderId));
+
         Map<String, Object> data = new HashMap<>();
         data.put("orderId", orderId);
         return ResponseUtil.ok(data);
@@ -563,6 +572,60 @@ public class WxOrderService {
     }
 
     /**
+     * 微信H5支付
+     *
+     * @param userId
+     * @param body
+     * @param request
+     * @return
+     */
+    @Transactional
+    public Object h5pay(Integer userId, String body, HttpServletRequest request) {
+        if (userId == null) {
+            return ResponseUtil.unlogin();
+        }
+        Integer orderId = JacksonUtil.parseInteger(body, "orderId");
+        if (orderId == null) {
+            return ResponseUtil.badArgument();
+        }
+
+        LitemallOrder order = orderService.findById(orderId);
+        if (order == null) {
+            return ResponseUtil.badArgumentValue();
+        }
+        if (!order.getUserId().equals(userId)) {
+            return ResponseUtil.badArgumentValue();
+        }
+
+        // 检测是否能够取消
+        OrderHandleOption handleOption = OrderUtil.build(order);
+        if (!handleOption.isPay()) {
+            return ResponseUtil.fail(ORDER_INVALID_OPERATION, "订单不能支付");
+        }
+
+        WxPayMwebOrderResult result = null;
+        try {
+            WxPayUnifiedOrderRequest orderRequest = new WxPayUnifiedOrderRequest();
+            orderRequest.setOutTradeNo(order.getOrderSn());
+            orderRequest.setTradeType("MWEB");
+            orderRequest.setBody("订单：" + order.getOrderSn());
+            // 元转成分
+            int fee = 0;
+            BigDecimal actualPrice = order.getActualPrice();
+            fee = actualPrice.multiply(new BigDecimal(100)).intValue();
+            orderRequest.setTotalFee(fee);
+            orderRequest.setSpbillCreateIp(IpUtil.getIpAddr(request));
+
+            result = wxPayService.createOrder(orderRequest);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return ResponseUtil.ok(result);
+    }
+
+    /**
      * 微信付款成功或失败回调接口
      * <p>
      * 1. 检测当前订单是否是付款状态;
@@ -660,6 +723,37 @@ public class WxOrderService {
             if (grouponService.updateById(groupon) == 0) {
                 return WxPayNotifyResponse.fail("更新数据已失效");
             }
+
+            // 团购已达成，更新关联订单支付状态
+            if (groupon.getGrouponId() > 0) {
+                List<LitemallGroupon> grouponList = grouponService.queryJoinRecord(groupon.getGrouponId());
+                if (grouponList.size() >= grouponRules.getDiscountMember() - 1) {
+                    for (LitemallGroupon grouponActivity : grouponList) {
+                        if (grouponActivity.getOrderId().equals(order.getId())) {
+                            //当前订单
+                            continue;
+                        }
+
+                        LitemallOrder grouponOrder = orderService.findById(grouponActivity.getOrderId());
+                        if (grouponOrder.getOrderStatus().equals(OrderUtil.STATUS_PAY_GROUPON)) {
+                            grouponOrder.setOrderStatus(OrderUtil.STATUS_PAY);
+                            orderService.updateWithOptimisticLocker(grouponOrder);
+                        }
+                    }
+
+                    LitemallGroupon grouponSource = grouponService.queryById(groupon.getGrouponId());
+                    LitemallOrder grouponOrder = orderService.findById(grouponSource.getOrderId());
+                    if (grouponOrder.getOrderStatus().equals(OrderUtil.STATUS_PAY_GROUPON)) {
+                        grouponOrder.setOrderStatus(OrderUtil.STATUS_PAY);
+                        orderService.updateWithOptimisticLocker(grouponOrder);
+                    }
+                }
+
+            } else {
+                order = orderService.findBySn(orderSn);
+                order.setOrderStatus(OrderUtil.STATUS_PAY_GROUPON);
+                orderService.updateWithOptimisticLocker(order);
+            }
         }
 
         //TODO 发送邮件和短信通知，这里采用异步发送
@@ -679,6 +773,9 @@ public class WxOrderService {
         };
 
         notifyService.notifyWxTemplate(result.getOpenid(), NotifyType.PAY_SUCCEED, parms, "pages/index/index?orderId=" + order.getId());
+
+        // 取消订单超时未支付任务
+        taskService.removeTask(new OrderUnpaidTask(order.getId()));
 
         return WxPayNotifyResponse.success("处理成功!");
     }
